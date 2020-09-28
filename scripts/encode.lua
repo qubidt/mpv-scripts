@@ -151,10 +151,7 @@ function start_encoding(from, to, settings)
     local start = seconds_to_time_string(from, false)
     local input_index = 0
     for input_path, tracks in pairs(get_input_info(path, settings.only_active_tracks)) do
-       append_args({
-            "-ss", start,
-            "-i", input_path,
-        })
+        append_args({"-ss", start, "-i", input_path})
         if settings.only_active_tracks then
             for _, track_index in ipairs(tracks) do
                 track_args = append_table(track_args, { "-map", string.format("%d:%d", input_index, track_index)})
@@ -199,41 +196,80 @@ function start_encoding(from, to, settings)
     local input_name = mp.get_property("filename/no-ext") or "encode"
     local title = mp.get_property("media-title")
     local extension = get_extension(path)
-    local output_name = get_output_string(output_directory, settings.output_format, input_name, extension, title, from, to, settings.profile)
+    local output_name = get_output_string(output_directory, settings.output_format,
+                                          input_name, extension, title, from, to,
+                                          settings.profile)
     if not output_name then
         mp.osd_message("Invalid path " .. output_directory)
         return
     end
-    args[#args + 1] = utils.join_path(output_directory, output_name)
 
-    if settings.print then
-        local o = ""
-        -- fuck this is ugly
-        for i = 1, #args do
-            local fmt = ""
-            if i == 1 then
-                fmt = "%s%s"
-            elseif i >= 2 and i <= 4 then
-                fmt = "%s"
-            elseif args[i-1] == "-i" or i == #args or args[i-1] == "-filter:v" then
-                fmt = "%s '%s'"
-            else
-                fmt = "%s %s"
-            end
-            o = string.format(fmt, o, args[i])
-        end
-        print(o)
+    local path = utils.join_path(output_directory, output_name)
+    if settings.multipass then
+        start_encoding_multipass(settings, args, path)
+    else
+        start_encoding_singlepass(settings, args, path)
     end
+end
+
+function print_args(args)
+    local o = ""
+    -- fuck this is ugly
+    for i = 1, #args do
+        local fmt = ""
+        if i == 1 then
+            fmt = "%s%s"
+        elseif i >= 2 and i <= 4 then
+            fmt = "%s"
+        elseif args[i-1] == "-i" or i == #args or args[i-1] == "-filter:v" then
+            fmt = "%s '%s'"
+        else
+            fmt = "%s %s"
+        end
+        o = string.format(fmt, o, args[i])
+    end
+    print(o)
+end
+
+function start_encoding_singlepass(settings, args, output_path, fn)
+    args[#args + 1] = output_path
+    if settings.print then print_args(args) end
+
     if settings.detached then
-        utils.subprocess_detached({ args = args })
+        mp.command_native_async(
+            append_table({"run"}, args),
+            function (success, result, error) if success and fn then fn() end end
+        )
     else
         local res = utils.subprocess({ args = args, max_size = 0, cancellable = false })
         if res.status == 0 then
-            mp.osd_message("Finished encoding succesfully")
+            if fn then
+                fn()
+            else
+                mp.osd_message("Finished encoding succesfully")
+            end
         else
             mp.osd_message("Failed to encode, check the log")
         end
     end
+end
+
+function start_encoding_multipass(settings, args, output_path)
+    if settings.detached then
+        print("Cannot combine multipass and detached settings.")
+        settings.detached = false
+    end
+
+    local args1 = append_table({}, args)
+    local args2 = append_table({}, args)
+
+    append_table(args1, {"-pass", "1", "-y", "-f", get_extension(output_path)})
+    append_table(args2, {"-pass", "2"})
+
+    local msgDone = function() mp.osd_message("Finished encoding succesfully") end
+    local pass2 = function() start_encoding_singlepass(settings, args2, output_path, msgDone) end
+
+    start_encoding_singlepass(settings, args1, "/dev/null", pass2)
 end
 
 function clear_timestamp()
@@ -256,59 +292,68 @@ function set_timestamp(profile)
     end
 
     if not start_timestamp or profile ~= profile_start then
-        profile_start = profile
-        start_timestamp = mp.get_property_number("time-pos")
-        local msg = function()
-            mp.osd_message(
-                string.format("encode [%s]: waiting for end timestamp", profile or "default"),
-                timer_duration
-            )
-        end
-        msg()
-        timer = mp.add_periodic_timer(timer_duration, msg)
-        mp.add_forced_key_binding("ESC", "encode-ESC", clear_timestamp)
-        mp.add_forced_key_binding("ENTER", "encode-ENTER", function() set_timestamp(profile) end)
+        set_timestamp_start(profile)
     else
-        local from = start_timestamp
-        local to = mp.get_property_number("time-pos")
-        if to <= from then
-            mp.osd_message("Second timestamp cannot be before the first", timer_duration)
-            timer:kill()
-            timer:resume()
-            return
-        end
-        clear_timestamp()
-        mp.osd_message(string.format("Encoding from %s to %s"
-            , seconds_to_time_string(from, false)
-            , seconds_to_time_string(to, false)
-        ), timer_duration)
-        -- include the current frame into the extract
-        local fps = mp.get_property_number("container-fps") or 30
-        to = to + 1 / fps / 2
-        local settings = {
-            detached = true,
-            container = "",
-            only_active_tracks = false,
-            preserve_filters = true,
-            append_filter = "",
-            codec = "-an -sn -c:v libvpx -crf 10 -b:v 1000k",
-            output_format = "$f_$n.webm",
-            output_directory = "",
-            ffmpeg_command = "ffmpeg",
-            print = true,
-        }
-        if profile then
-            options.read_options(settings, profile)
-            if settings.container ~= "" then
-                msg.warn("The 'container' setting is deprecated, use 'output_format' now")
-                settings.output_format = settings.output_format .. "." .. settings.container
-            end
-            settings.profile = profile
-        else
-            settings.profile = "default"
-        end
-        start_encoding(from, to, settings)
+        set_timestamp_end(profile)
     end
+end
+
+function set_timestamp_start(profile)
+    profile_start = profile
+    start_timestamp = mp.get_property_number("time-pos")
+    local msg = function()
+        mp.osd_message(
+            string.format("encode [%s]: waiting for end timestamp", profile or "default"),
+            timer_duration
+        )
+    end
+    msg()
+    timer = mp.add_periodic_timer(timer_duration, msg)
+    mp.add_forced_key_binding("ESC", "encode-ESC", clear_timestamp)
+    mp.add_forced_key_binding("ENTER", "encode-ENTER", function() set_timestamp(profile) end)
+end
+
+function set_timestamp_end(profile)
+    local from = start_timestamp
+    local to = mp.get_property_number("time-pos")
+    if to <= from then
+        mp.osd_message("Second timestamp cannot be before the first", timer_duration)
+        timer:kill()
+        timer:resume()
+        return
+    end
+    clear_timestamp()
+    mp.osd_message(string.format("Encoding from %s to %s"
+                                 , seconds_to_time_string(from, false)
+                                 , seconds_to_time_string(to, false)
+                                ), timer_duration)
+    -- include the current frame into the extract
+    local fps = mp.get_property_number("container-fps") or 30
+    to = to + 1 / fps / 2
+    local settings = {
+        detached = true,
+        multipass = false,
+        container = "",
+        only_active_tracks = false,
+        preserve_filters = true,
+        append_filter = "",
+        codec = "-an -sn -c:v libvpx -crf 10 -b:v 1000k",
+        output_format = "$f_$n.webm",
+        output_directory = "",
+        ffmpeg_command = "ffmpeg",
+        print = true,
+    }
+    if profile then
+        options.read_options(settings, profile)
+        if settings.container ~= "" then
+            msg.warn("The 'container' setting is deprecated, use 'output_format' now")
+            settings.output_format = settings.output_format .. "." .. settings.container
+        end
+        settings.profile = profile
+    else
+        settings.profile = "default"
+    end
+    start_encoding(from, to, settings)
 end
 
 mp.add_key_binding(nil, "set-timestamp", set_timestamp)
